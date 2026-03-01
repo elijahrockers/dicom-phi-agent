@@ -54,3 +54,23 @@ class ScanReport(BaseModel):
     @property
     def has_phi(self) -> bool:
         return self.total_phi_count > 0
+
+
+class FileError(BaseModel):
+    """A per-file error encountered during batch scanning."""
+
+    filepath: str
+    error: str
+
+
+class BatchReport(BaseModel):
+    """Aggregate report for a batch/directory scan."""
+
+    directory: str
+    total_files: int
+    files_with_phi: int
+    files_clean: int
+    files_errored: int
+    risk_breakdown: dict[str, int]
+    reports: list[ScanReport]
+    errors: list[FileError]
