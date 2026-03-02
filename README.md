@@ -14,23 +14,23 @@ flowchart TB
 
     subgraph Layer1["Layer 1: Header Tag Analysis"]
         PARSE[pydicom Tag Parser]
-        HIPAA[HIPAA Safe Harbor\n18 Identifier Check]
+        HIPAA[HIPAA Safe Harbor<br/>18 Identifier Check]
         PARSE --> HIPAA
     end
 
     subgraph Layer2["Layer 2: Pixel PHI Detection"]
-        EXTRACT[Pixel Data Extraction\npydicom + Pillow]
-        OCR[EasyOCR\nText + Bounding Boxes]
+        EXTRACT[Pixel Data Extraction<br/>pydicom + Pillow]
+        OCR[EasyOCR<br/>Text + Bounding Boxes]
         EXTRACT --> OCR
     end
 
     subgraph Output
-        REPORT[Scan Report\nJSON + Summary]
-        RECS[Remediation\nRecommendations]
+        REPORT[Scan Report<br/>JSON + Summary]
+        RECS[Remediation<br/>Recommendations]
     end
 
     DCM --> Layer1
-    DCM -->|"BurnedInAnnotation\nYES or missing"| Layer2
+    DCM -->|"BurnedInAnnotation<br/>YES or missing"| Layer2
     Layer1 -->|findings| Output
     Layer2 -->|findings| Output
 ```
