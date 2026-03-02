@@ -14,3 +14,8 @@ venv/
 .ruff_cache/
 .pytest_cache/
 TODO.md
+
+# TCIA MIDI-B dataset and answer keys (large binary files)
+TCIA-MIDI-B-Synthetic-Validation_20250502/
+TCIA-answer-key/
+PKG*/
