@@ -13,6 +13,8 @@ venv/
 !fixtures/*.dcm
 .ruff_cache/
 .pytest_cache/
+
+CLAUDE.md
 TODO.md
 
 # TCIA MIDI-B dataset and answer keys (large binary files)
