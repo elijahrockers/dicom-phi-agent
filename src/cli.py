@@ -5,24 +5,18 @@ import logging
 import sys
 from pathlib import Path
 
-from .agent import run_agent, run_direct_scan
+from .scanner import scan_file
 from .models import BatchReport, FileError, ScanReport
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DICOM PHI Screening Agent — scan DICOM files for protected health information"
+        description="DICOM PHI Scanner — scan DICOM files for protected health information"
     )
     parser.add_argument("filepath", nargs="?", default=None,
                         help="Path to a single DICOM file")
     parser.add_argument("--dir", dest="directory",
                         help="Recursively scan directory for .dcm files")
-    parser.add_argument(
-        "--mode",
-        choices=["agent", "direct"],
-        default="direct",
-        help="Scan mode: 'agent' uses Claude orchestration, 'direct' runs scans sequentially (default: direct)",
-    )
     parser.add_argument(
         "--output",
         choices=["json", "summary"],
@@ -47,17 +41,14 @@ def main():
     )
 
     if args.directory:
-        batch = _run_batch(args.directory, args.mode)
+        batch = _run_batch(args.directory)
         if args.output == "json":
             print(batch.model_dump_json(indent=2))
         else:
             _print_batch_summary(batch)
     else:
         try:
-            if args.mode == "agent":
-                report = run_agent(args.filepath)
-            else:
-                report = run_direct_scan(args.filepath)
+            report = scan_file(args.filepath)
         except FileNotFoundError:
             print(f"Error: File not found: {args.filepath}", file=sys.stderr)
             sys.exit(1)
@@ -89,7 +80,7 @@ def _discover_dcm_files(directory: str) -> list[str]:
     return files
 
 
-def _run_batch(directory: str, mode: str) -> BatchReport:
+def _run_batch(directory: str) -> BatchReport:
     """Scan all .dcm files in a directory and return an aggregate report."""
     files = _discover_dcm_files(directory)
     total = len(files)
@@ -97,16 +88,9 @@ def _run_batch(directory: str, mode: str) -> BatchReport:
     reports: list[ScanReport] = []
     errors: list[FileError] = []
 
-    import anthropic
-
-    client = anthropic.Anthropic()
-
     for i, filepath in enumerate(files, 1):
         try:
-            if mode == "agent":
-                report = run_agent(filepath, client=client)
-            else:
-                report = run_direct_scan(filepath, client=client)
+            report = scan_file(filepath)
             reports.append(report)
             risk = report.risk_level.value.upper()
             print(

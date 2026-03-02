@@ -1,18 +1,17 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "dicom-phi-agent"
 version = "0.1.0"
-description = "Agentic pipeline for scanning DICOM datasets for PHI using header analysis, OCR, and Claude AI classification"
+description = "Two-layer DICOM PHI detection: header tag analysis and OCR pixel inspection"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Elijah Rockers", email = "elijah.rockers@gmail.com"}]
 
 dependencies = [
-    "anthropic>=0.39.0",
     "pydicom>=2.4.0",
     "Pillow>=10.0.0",
     "pytesseract>=0.3.10",

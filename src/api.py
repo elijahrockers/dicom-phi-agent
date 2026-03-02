@@ -3,33 +3,23 @@
 import tempfile
 from pathlib import Path
 
-import anthropic
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 
-from .agent import run_agent, run_direct_scan
+from .scanner import scan_file
 from .models import ScanReport
 
 app = FastAPI(
-    title="DICOM PHI Screening Agent",
-    description="Agentic pipeline for scanning DICOM datasets for PHI",
+    title="DICOM PHI Scanner",
+    description="Two-layer pipeline for scanning DICOM datasets for PHI",
     version="0.1.0",
 )
-
-client = anthropic.Anthropic()
 
 
 @app.post("/scan", response_model=ScanReport)
 async def scan_dicom(
     file: UploadFile = File(...),
-    mode: str = "agent",
 ):
-    """Upload and scan a DICOM file for PHI.
-
-    Args:
-        file: DICOM file upload.
-        mode: 'agent' for Claude-orchestrated scan, 'direct' for sequential scan.
-    """
+    """Upload and scan a DICOM file for PHI."""
     if not file.filename or not file.filename.lower().endswith((".dcm", ".dicom")):
         raise HTTPException(400, "File must be a DICOM file (.dcm)")
 
@@ -39,10 +29,7 @@ async def scan_dicom(
         tmp_path = tmp.name
 
     try:
-        if mode == "agent":
-            report = run_agent(tmp_path, client)
-        else:
-            report = run_direct_scan(tmp_path, client)
+        report = scan_file(tmp_path)
         return report
     except Exception as e:
         raise HTTPException(500, f"Scan failed: {str(e)}")
