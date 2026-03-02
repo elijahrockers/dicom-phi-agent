@@ -1,16 +1,15 @@
 # CLAUDE.md — dicom-phi-agent
 
-Two-layer DICOM PHI detection: header tag analysis + OCR pixel inspection with Claude classification.
+Two-layer DICOM PHI detection: header tag analysis + EasyOCR pixel inspection.
 
 ## Quick Start
 
 ```bash
 pip install -e .
-export ANTHROPIC_API_KEY=...
 python fixtures/create_test_fixtures.py   # Generate synthetic test DICOMs
-dicom-phi-scan fixtures/test_phi_header.dcm              # CLI (agent mode)
-dicom-phi-scan fixtures/test_phi_header.dcm --mode direct # CLI (no agent)
-dicom-phi-scan fixtures/test_phi_header.dcm --output json # JSON output
+dicom-phi-scan image.dcm -o report.json                    # Single file
+dicom-phi-scan --dir ./dataset -L -o results.jsonl         # Batch scan
+dicom-phi-scan --dir ./dataset -L -o results.jsonl --limit 50
 uvicorn src.api:app --reload              # REST API at localhost:8000
 pytest                                    # Unit tests
 ruff check .                              # Lint
@@ -20,11 +19,24 @@ ruff check .                              # Lint
 
 - `src/scanner.py` — `scan_file()` entry point: runs header scan, then conditional OCR pixel scan
 - `src/tag_scanner.py` — Layer 1: checks ~40 DICOM tags against `PHI_TAGS` dict (HIPAA Safe Harbor 18 identifiers). Skips deidentified placeholders (ANONYMOUS, REMOVED, etc.) and NONE/UNKNOWN values
-- `src/pixel_scanner.py` — Layer 2: pytesseract OCR + Claude classification. Runs only when BurnedInAnnotation is YES or missing
-- `src/agent.py` — Agent mode: Claude tool use to orchestrate both layers
+- `src/pixel_scanner.py` — Layer 2: EasyOCR text detection. Runs only when BurnedInAnnotation is YES or missing. All detected text flagged as potential PHI.
 - `src/models.py` — Pydantic models: `PHITagFinding`, `PixelPHIFinding`, `ScanReport`, `BatchReport`
-- `src/cli.py` — CLI entry point (`dicom-phi-scan`), supports `--dir` for batch scanning
+- `src/cli.py` — CLI entry point (`dicom-phi-scan`). Requires `-o` for output file. Supports `--dir` for batch scanning (JSONL), `-L` for symlinks, `--limit` to cap file count.
 - `src/api.py` — FastAPI REST API (POST /scan, GET /health)
+
+## CLI
+
+```
+dicom-phi-scan image.dcm -o report.json           # single file -> pretty JSON
+dicom-phi-scan --dir path/ -o results.jsonl        # batch -> JSONL (one object/line)
+dicom-phi-scan --dir path/ -L -o results.jsonl     # follow symlinks
+dicom-phi-scan --dir path/ -o results.jsonl --limit 50
+
+# Query JSONL reports
+jq 'select(.risk_level == "high") | .filepath' results.jsonl
+```
+
+Summary is always printed to screen. `-o` writes machine-readable JSON/JSONL to file. Batch mode streams results to disk and accumulates only stats in memory (no OOM on large datasets).
 
 ## TCIA MIDI-B Synthetic Validation Dataset
 
@@ -99,21 +111,31 @@ Our `PHI_TAGS` dict covers ~22 of 62 answer-key PHI tags. Smoke test (`scripts/s
 - Private vendor tags: GE GEMS (`[Slop_int_*]`, `[Service id]`), Siemens
 - Other: `(0040,*)` procedure tags, Text Value, Verifying Observer Name
 
+### TCIA subset
+
+`scripts/create_tcia_subset.py` creates a `TCIA-subset/` directory of symlinks to the full dataset for faster iteration:
+
+```bash
+python scripts/create_tcia_subset.py                  # ~50 series, seed=42
+python scripts/create_tcia_subset.py --target 200     # larger subset
+python scripts/create_tcia_subset.py --force           # overwrite existing
+```
+
 ### Smoke test
 
 ```bash
 python scripts/smoke_test_midi.py            # random sample, 1 file per modality
 python scripts/smoke_test_midi.py --seed 42  # reproducible
+python scripts/smoke_test_midi.py --tcia-dir TCIA-subset --count 50 --seed 42
 ```
 
-Falls back to header-only scan if tesseract is not installed. Reports per-file and overall TP/FN rates against the answer key.
+Reports per-file and overall TP/FN rates against the answer key.
 
 ## Conventions
 
 - Python 3.10+, editable install with `pip install -e .`
 - Ruff: line-length=100, target py310
 - pytest for tests (`tests/`)
-- Claude API calls use claude-sonnet-4-20250514 with tool use
 - All test/fixture data is synthetic — never use real patient data
 - Scripts go in `scripts/` (utilities, not part of the package)
 - PHI and patient privacy are primary concerns in all work

@@ -34,6 +34,11 @@ def scan_file(filepath: str) -> ScanReport:
     pixel_findings = []
     if not bia_present or (bia_value and bia_value.upper() == "YES"):
         pixel_findings = scan_pixels(ds)
+        # Free pixel data — no longer needed, findings are extracted
+        try:
+            del ds.PixelData
+        except AttributeError:
+            pass
 
     total = len(tag_findings) + len(pixel_findings)
     high_count = sum(1 for f in tag_findings if f.severity == Severity.HIGH) + sum(

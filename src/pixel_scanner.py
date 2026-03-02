@@ -1,13 +1,13 @@
 """Layer 2: Pixel matrix PHI detection via OCR.
 
-Extracts pixel data to images, runs pytesseract OCR for text with bounding boxes,
+Extracts pixel data to images, runs EasyOCR for text with bounding boxes,
 and flags all detected text as potential PHI (burned-in text is inherently suspicious).
 """
 
 import logging
 
+import easyocr
 import numpy as np
-import pytesseract
 from PIL import Image
 from pydicom.dataset import Dataset
 
@@ -15,9 +15,20 @@ from .models import BoundingBox, PixelPHIFinding, Severity
 
 logger = logging.getLogger(__name__)
 
-# Minimum pytesseract confidence (0-100) to accept an OCR result.
+# Minimum EasyOCR confidence (0.0-1.0) to accept an OCR result.
 # Below this threshold, detections are treated as noise and discarded.
-MIN_OCR_CONFIDENCE = 30
+MIN_OCR_CONFIDENCE = 0.30
+
+# Lazy singleton EasyOCR reader — avoids reloading ~100MB model per call.
+_reader: easyocr.Reader | None = None
+
+
+def _get_reader() -> easyocr.Reader:
+    """Return a shared EasyOCR Reader, creating it on first use."""
+    global _reader
+    if _reader is None:
+        _reader = easyocr.Reader(["en"], gpu=False)
+    return _reader
 
 
 def extract_image(ds: Dataset) -> Image.Image | None:
@@ -52,27 +63,34 @@ def extract_image(ds: Dataset) -> Image.Image | None:
 
 
 def run_ocr(image: Image.Image) -> list[dict]:
-    """Run pytesseract OCR and return text with bounding boxes.
+    """Run EasyOCR and return text with bounding boxes.
 
     Returns:
-        List of dicts with keys: text, x, y, width, height, conf
+        List of dicts with keys: text, x, y, width, height, conf (conf 0-100)
     """
-    ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    reader = _get_reader()
+    ocr_data = reader.readtext(np.array(image))
 
     results = []
-    n_boxes = len(ocr_data["text"])
-    for i in range(n_boxes):
-        text = ocr_data["text"][i].strip()
-        conf = int(ocr_data["conf"][i])
+    for bbox, text, conf in ocr_data:
+        text = text.strip()
         if text and conf > MIN_OCR_CONFIDENCE:
+            # bbox is [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] — convert to {x, y, width, height}
+            xs = [pt[0] for pt in bbox]
+            ys = [pt[1] for pt in bbox]
+            x = int(min(xs))
+            y = int(min(ys))
+            width = int(max(xs) - x)
+            height = int(max(ys) - y)
+
             results.append(
                 {
                     "text": text,
-                    "x": ocr_data["left"][i],
-                    "y": ocr_data["top"][i],
-                    "width": ocr_data["width"][i],
-                    "height": ocr_data["height"][i],
-                    "conf": conf,
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "conf": int(conf * 100),
                 }
             )
 

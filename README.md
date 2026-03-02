@@ -20,7 +20,7 @@ flowchart TB
 
     subgraph Layer2["Layer 2: Pixel PHI Detection"]
         EXTRACT[Pixel Data Extraction\npydicom + Pillow]
-        OCR[pytesseract OCR\nText + Bounding Boxes]
+        OCR[EasyOCR\nText + Bounding Boxes]
         EXTRACT --> OCR
     end
 
@@ -50,7 +50,7 @@ Common de-identification placeholders (ANONYMOUS, REDACTED, etc.) are filtered o
 ### Layer 2 — Pixel PHI Detection (`src/pixel_scanner.py`)
 Detects PHI burned into pixel data (common in ultrasound, CR, secondary capture):
 1. Extracts pixel data to image via `pydicom` + `Pillow`
-2. Runs `pytesseract` OCR to extract text with bounding box coordinates and confidence scores
+2. Runs EasyOCR to extract text with bounding box coordinates and confidence scores
 3. All detected text above the confidence threshold is flagged as potential PHI
 
 ### Scanning Pipeline (`src/scanner.py`)
@@ -61,31 +61,30 @@ Detects PHI burned into pixel data (common in ultrasound, CR, secondary capture)
 ## Requirements
 
 - Python 3.10+
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) installed and on PATH
 
 ## Quick Start
 
 ```bash
-# Install
+# Install (editable mode — code changes take effect immediately)
 pip install -e .
 
 # Create test fixtures (synthetic data only)
 python fixtures/create_test_fixtures.py
 
-# Scan a single file
-dicom-phi-scan fixtures/test_phi_header.dcm
-
-# JSON output
-dicom-phi-scan fixtures/test_phi_header.dcm --output json
+# Scan a single file (summary to screen, JSON report to file)
+dicom-phi-scan fixtures/test_phi_header.dcm -o report.json
 
 # Batch scan a directory
-dicom-phi-scan --dir fixtures/
+dicom-phi-scan --dir fixtures/ -o results.jsonl
 
-# Verbose logging
-dicom-phi-scan fixtures/test_phi_header.dcm -v
+# Follow symlinks (e.g. for symlinked dataset subsets)
+dicom-phi-scan --dir TCIA-subset -L -o results.jsonl
 
-# Run the REST API
-uvicorn src.api:app --reload
+# Limit number of files in batch mode
+dicom-phi-scan --dir TCIA-subset -L -o results.jsonl --limit 50
+
+# Query the JSONL report for HIGH risk files
+jq 'select(.risk_level == "high") | .filepath' results.jsonl
 ```
 
 ## REST API
@@ -127,9 +126,13 @@ src/
 └── tag_scanner.py     # Layer 1: DICOM header tag analysis
 tests/
 ├── test_api.py
+├── test_cli.py
 ├── test_pixel_scanner.py
 ├── test_scanner.py
 └── test_tag_scanner.py
+scripts/
+├── create_tcia_subset.py   # Create symlinked TCIA subset for benchmarking
+└── smoke_test_midi.py      # Benchmark against TCIA MIDI-B answer key
 fixtures/
 └── create_test_fixtures.py  # Generate synthetic test DICOMs
 ```
@@ -152,6 +155,9 @@ pytest
 
 # Lint
 ruff check .
+
+# Benchmark against TCIA MIDI-B answer key
+python scripts/smoke_test_midi.py --seed 42
 ```
 
 ## Design Decisions
@@ -159,11 +165,12 @@ ruff check .
 - **Two-layer approach**: Header-only scanning misses burned-in annotations, which are common in ultrasound, CR, and secondary capture DICOM objects. Pixel analysis catches what tag scanning cannot.
 - **Flag all OCR text as PHI**: Rather than attempting to classify burned-in text (which risks false negatives), all OCR-detected text is flagged as potential PHI. This conservative approach prioritizes patient privacy.
 - **BurnedInAnnotation tag is checked but not trusted**: This tag is frequently missing or incorrectly set in real-world DICOM data. Pixel analysis still runs when the tag is absent.
+- **Streaming batch output**: Batch scans stream per-file JSONL to disk and accumulate only lightweight stats in memory, avoiding OOM on large datasets.
 - **Synthetic test data**: Real DICOM datasets from TCIA are already de-identified and don't exercise the PHI detection path. Synthetic fixtures with planted fake PHI give controlled, repeatable test cases.
 
 ## Stack
 
-Python · pydicom · Pillow · pytesseract · Pydantic · FastAPI
+Python · pydicom · Pillow · EasyOCR · Pydantic · FastAPI
 
 ## License
 
