@@ -264,7 +264,7 @@ def test_banner_height_non_positive_is_error(tmp_path):
         redact_dataset(ds, 0)
 
 
-def test_no_pixel_data_copied_through(tmp_path):
+def _make_no_pixel_ds() -> Dataset:
     ds = Dataset()
     ds.file_meta = FileMetaDataset()
     ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
@@ -273,17 +273,33 @@ def test_no_pixel_data_copied_through(tmp_path):
     ds.SOPClassUID = ds.file_meta.MediaStorageSOPClassUID
     ds.SOPInstanceUID = ds.file_meta.MediaStorageSOPInstanceUID
     ds.PatientName = "TEST"
-    src = _write(ds, tmp_path / "in.dcm")
+    return ds
+
+
+def test_no_pixel_data_copied_through(tmp_path):
+    src = _write(_make_no_pixel_ds(), tmp_path / "in.dcm")
     before = (tmp_path / "in.dcm").read_bytes()
     out = str(tmp_path / "out.dcm")
 
-    result = redact_file(src, out, banner_height=10)
+    result = redact_file(src, out, banner_height=10, on_unredactable="copy")
 
     assert result.status == "copied"
+    assert result.frames == 0  # benign: nothing to redact
     assert open(out, "rb").read() == before  # copied unchanged
 
 
-def test_palette_color_skipped(tmp_path):
+def test_no_pixel_data_omitted(tmp_path):
+    src = _write(_make_no_pixel_ds(), tmp_path / "in.dcm")
+    out = str(tmp_path / "out.dcm")
+
+    result = redact_file(src, out, banner_height=10, on_unredactable="omit")
+
+    assert result.status == "omitted"
+    assert result.frames == 0
+    assert not (tmp_path / "out.dcm").exists()  # nothing written
+
+
+def _make_palette_ds() -> Dataset:
     ds = Dataset()
     ds.file_meta = FileMetaDataset()
     ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
@@ -297,10 +313,102 @@ def test_palette_color_skipped(tmp_path):
     ds.PixelRepresentation = 0
     ds.PhotometricInterpretation = "PALETTE COLOR"
     ds.PixelData = bytes(16)
-    src = _write(ds, tmp_path / "in.dcm")
+    return ds
+
+
+def test_palette_color_omitted(tmp_path):
+    src = _write(_make_palette_ds(), tmp_path / "in.dcm")
     out = str(tmp_path / "out.dcm")
 
-    result = redact_file(src, out, banner_height=2)
+    result = redact_file(src, out, banner_height=2, on_unredactable="omit")
 
-    assert result.status == "skipped"
+    assert result.status == "omitted"
+    assert "PALETTE COLOR" in (result.message or "")
     assert not (tmp_path / "out.dcm").exists()  # no bad file written
+
+
+def test_palette_color_copied_through(tmp_path):
+    src = _write(_make_palette_ds(), tmp_path / "in.dcm")
+    before = (tmp_path / "in.dcm").read_bytes()
+    out = str(tmp_path / "out.dcm")
+
+    result = redact_file(src, out, banner_height=2, on_unredactable="copy")
+
+    assert result.status == "copied"
+    assert result.frames >= 1  # had pixels -> PHI-relevant copy
+    assert open(out, "rb").read() == before  # original bytes preserved
+
+
+# --- undeterminable banner height -> on_unredactable governs outcome --------
+
+def test_undetermined_banner_height_copy(tmp_path):
+    # RGB with pixels but no (0018,6011) and no override -> can't redact.
+    rng = np.random.default_rng(6)
+    arr = rng.integers(1, 255, size=(40, 40, 3), dtype=np.uint8)
+    src = _write(_make_ds(arr, "RGB", 3), tmp_path / "in.dcm")
+    before = (tmp_path / "in.dcm").read_bytes()
+    out = str(tmp_path / "out.dcm")
+
+    result = redact_file(src, out, banner_height=None, on_unredactable="copy")
+
+    assert result.status == "copied"
+    assert result.frames >= 1
+    assert "0018,6011" in (result.message or "")
+    assert open(out, "rb").read() == before  # copied through un-redacted
+
+
+def test_undetermined_banner_height_omit(tmp_path):
+    rng = np.random.default_rng(7)
+    arr = rng.integers(1, 255, size=(40, 40, 3), dtype=np.uint8)
+    src = _write(_make_ds(arr, "RGB", 3), tmp_path / "in.dcm")
+    out = str(tmp_path / "out.dcm")
+
+    result = redact_file(src, out, banner_height=None, on_unredactable="omit")
+
+    assert result.status == "omitted"
+    assert result.frames >= 1
+    assert not (tmp_path / "out.dcm").exists()  # nothing written
+
+
+def test_unknown_on_unredactable_rejected(tmp_path):
+    arr = np.zeros((10, 10, 3), dtype=np.uint8)
+    src = _write(_make_ds(arr, "RGB", 3), tmp_path / "in.dcm")
+    with pytest.raises(RedactionError):
+        redact_file(src, str(tmp_path / "out.dcm"), banner_height=2, on_unredactable="bogus")
+
+
+# --- CLI batch: manifest has one line per input file ------------------------
+
+def test_batch_manifest_one_line_per_file(tmp_path):
+    import json
+
+    from dicom_phi_scan.cli import _run_redact_batch
+
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    out_dir = tmp_path / "out"
+    manifest = tmp_path / "run.jsonl"
+
+    # (1) redactable RGB with an ultrasound region
+    a = _make_ds(np.full((40, 40, 3), 200, dtype=np.uint8), "RGB", 3)
+    reg = Dataset()
+    reg.RegionLocationMinY0 = 6
+    a.SequenceOfUltrasoundRegions = [reg]
+    _write(a, in_dir / "a.dcm")
+    # (2) RGB with pixels but no region and no --banner-height -> unredactable
+    _write(_make_ds(np.full((40, 40, 3), 200, dtype=np.uint8), "RGB", 3), in_dir / "b.dcm")
+
+    rc = _run_redact_batch(
+        str(in_dir), str(out_dir), False,
+        banner_height=None, compress="none", to_rgb=False,
+        on_unredactable="omit", manifest=str(manifest), force=False, limit=None,
+    )
+
+    lines = [json.loads(ln) for ln in manifest.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 2  # one line per input file
+    statuses = {row["status"] for row in lines}
+    assert statuses == {"redacted", "omitted"}
+    assert rc == 2  # the omitted file (with pixels) needs review
+    # redacted file was written; omitted file was not
+    assert (out_dir / "a.dcm").exists()
+    assert not (out_dir / "b.dcm").exists()

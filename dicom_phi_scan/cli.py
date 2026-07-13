@@ -15,9 +15,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .models import RedactionResult, ScanReport
 
-# Mirrors redactor.COMPRESS_CHOICES; kept literal so argparse doesn't force the
-# heavy pydicom/numpy import in redactor until after argument validation.
+# Mirrors redactor.COMPRESS_CHOICES / ON_UNREDACTABLE_CHOICES; kept literal so argparse
+# doesn't force the heavy pydicom/numpy import in redactor until after argument validation.
 REDACT_COMPRESS_CHOICES = ("none", "rle", "jpeg-ls", "jpeg2000", "jpeg")
+REDACT_ON_UNREDACTABLE_CHOICES = ("copy", "omit")
 
 
 def main():
@@ -29,18 +30,25 @@ def main():
             "  dicom-phi-scan --dir ./dataset -L -o results.jsonl\n"
             "  dicom-phi-scan --dir ./dataset -L -o results.jsonl --limit 50\n"
             "\n"
-            "redact the top banner (writes redacted copies; originals untouched):\n"
-            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted\n"
-            "  dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted --banner-height 80\n"
-            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress jpeg-ls\n"
+            "redact the top banner (writes redacted copies; originals untouched;\n"
+            "--on-unredactable and --manifest are required):\n"
+            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \\\n"
+            "      --on-unredactable omit --manifest run.jsonl\n"
+            "  dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted --banner-height 80 \\\n"
+            "      --on-unredactable copy --manifest run.jsonl\n"
+            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \\\n"
+            "      --compress jpeg-ls --on-unredactable omit --manifest run.jsonl\n"
             "\n"
             "query the JSONL report:\n"
             "  jq 'select(.risk_level == \"high\") | .filepath' results.jsonl\n"
             "\n"
-            "exit codes:\n"
+            "exit codes (scan mode):\n"
             "  0  all files clean\n"
             "  1  PHI detected in one or more files\n"
             "  2  one or more files errored\n"
+            "exit codes (redact mode):\n"
+            "  0  every file redacted (or benignly copied/omitted with no pixel data)\n"
+            "  2  one or more files not fully redacted — review the manifest\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -93,6 +101,19 @@ def main():
         help="Convert YBR color frames to RGB on output (default: keep native color)",
     )
     redact.add_argument(
+        "--on-unredactable", dest="on_unredactable",
+        choices=REDACT_ON_UNREDACTABLE_CHOICES, default=None,
+        help="Required with --redact-banner: what to do with a file that cannot be "
+             "redacted (no pixels, no banner height, decode failure). 'copy' writes the "
+             "original through unchanged (may ship un-redacted pixels); 'omit' writes "
+             "nothing for it. Every outcome is recorded in --manifest.",
+    )
+    redact.add_argument(
+        "--manifest", dest="manifest", default=None,
+        help="Required with --redact-banner: path to a JSONL manifest with one line per "
+             "input file recording its outcome (status, reason, paths).",
+    )
+    redact.add_argument(
         "--force", action="store_true",
         help="Overwrite existing files in --output-dir (default: refuse)",
     )
@@ -125,6 +146,14 @@ def main():
         if not args.output_dir:
             print("Error: --redact-banner requires --output-dir", file=sys.stderr)
             sys.exit(1)
+        if not args.on_unredactable:
+            print("Error: --redact-banner requires --on-unredactable {copy,omit} "
+                  "(choose what happens to files that cannot be redacted)", file=sys.stderr)
+            sys.exit(1)
+        if not args.manifest:
+            print("Error: --redact-banner requires --manifest PATH "
+                  "(a JSONL record of every file's outcome)", file=sys.stderr)
+            sys.exit(1)
         if args.output_file:
             print("Error: -o/--output is not used with --redact-banner (use --output-dir)",
                   file=sys.stderr)
@@ -136,13 +165,15 @@ def main():
             rc = _run_redact_batch(
                 args.directory, args.output_dir, args.follow_symlinks,
                 banner_height=args.banner_height, compress=args.compress,
-                to_rgb=args.to_rgb, force=args.force, limit=args.limit,
+                to_rgb=args.to_rgb, on_unredactable=args.on_unredactable,
+                manifest=args.manifest, force=args.force, limit=args.limit,
             )
         else:
             rc = _run_redact_single(
                 args.filepath, args.output_dir,
                 banner_height=args.banner_height, compress=args.compress,
-                to_rgb=args.to_rgb, force=args.force,
+                to_rgb=args.to_rgb, on_unredactable=args.on_unredactable,
+                manifest=args.manifest, force=args.force,
             )
         sys.exit(rc)
 
@@ -426,12 +457,38 @@ def _print_redaction(result: "RedactionResult", index: int | None, total: int | 
         detail = (f" -- REDACTED {result.frames}f, top {result.banner_height}px"
                   f", {result.photometric_in}->{result.photometric_out}")
     elif result.status == "copied":
-        detail = " -- COPIED (no pixel data)"
-    elif result.status == "skipped":
-        detail = f" -- SKIPPED ({result.message})"
+        detail = f" -- COPIED ({result.message})"
+    elif result.status == "omitted":
+        detail = f" -- OMITTED ({result.message})"
     else:  # error
         detail = f" -- ERROR: {result.message}"
     print(f"{prefix}{Path(result.output_path).name}{detail}")
+
+
+def _redaction_error_result(
+    input_path: str, output_path: str, message: str
+) -> "RedactionResult":
+    """Build a RedactionResult for a failure handled in the CLI (before/around redact_file)."""
+    from .models import RedactionResult
+
+    return RedactionResult(
+        input_path=input_path, output_path=output_path, status="error",
+        frames=0, banner_height=0, photometric_in=None, photometric_out=None,
+        transfer_syntax_out=None, message=message,
+    )
+
+
+def _redaction_needs_review(result: "RedactionResult") -> bool:
+    """True if a file was not fully redacted in a PHI-relevant way (drives exit code 2).
+
+    A ``copied``/``omitted`` file is benign only when it had no pixels to redact
+    (``frames == 0``); otherwise un-redacted pixels were shipped or dropped.
+    """
+    if result.status == "redacted":
+        return False
+    if result.status in ("copied", "omitted"):
+        return result.frames >= 1
+    return True  # error
 
 
 def _run_redact_single(
@@ -441,37 +498,37 @@ def _run_redact_single(
     banner_height: int | None,
     compress: str,
     to_rgb: bool,
+    on_unredactable: str,
+    manifest: str,
     force: bool,
 ) -> int:
-    """Redact a single file to output_dir. Returns exit code (0 ok, 2 error)."""
-    from .redactor import RedactionError, redact_file
-
-    if not os.path.isfile(filepath):
-        print(f"Error: File not found: {filepath}", file=sys.stderr)
-        return 2
+    """Redact a single file to output_dir; write a one-line manifest. Returns exit code."""
+    from .redactor import redact_file
 
     out_path = _redact_out_path(filepath, None, output_dir)
-    if os.path.exists(out_path) and not force:
-        print(f"Error: Output exists (use --force): {out_path}", file=sys.stderr)
-        return 2
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    try:
-        result = redact_file(
-            filepath, out_path, banner_height=banner_height,
-            compress=compress, to_rgb=to_rgb,
-        )
-    except RedactionError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
+    if not os.path.isfile(filepath):
+        result = _redaction_error_result(filepath, out_path, f"file not found: {filepath}")
+    elif os.path.exists(out_path) and not force:
+        result = _redaction_error_result(filepath, out_path, "output exists (use --force)")
+    else:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        try:
+            result = redact_file(
+                filepath, out_path, banner_height=banner_height,
+                compress=compress, to_rgb=to_rgb, on_unredactable=on_unredactable,
+            )
+        except Exception as e:  # unexpected — record rather than crash
+            result = _redaction_error_result(filepath, out_path, str(e))
+
+    with open(manifest, "w") as mf:
+        mf.write(result.model_dump_json() + "\n")
 
     _print_redaction(result, None, None)
     if result.status == "redacted":
         print(f"Redacted copy written to {out_path}")
-    return 2 if result.status == "error" else 0
+    print(f"Manifest: {manifest}")
+    return 2 if _redaction_needs_review(result) else 0
 
 
 def _run_redact_batch(
@@ -482,12 +539,15 @@ def _run_redact_batch(
     banner_height: int | None,
     compress: str,
     to_rgb: bool,
+    on_unredactable: str,
+    manifest: str,
     force: bool,
     limit: int | None,
 ) -> int:
     """Redact every .dcm under directory into output_dir, preserving structure.
 
-    Returns exit code: 0 = all redacted/copied, 2 = one or more errored.
+    Writes one JSONL manifest line per discovered file. Returns exit code: 0 = every
+    file redacted or benignly copied/omitted, 2 = one or more files need review.
     """
     from .redactor import redact_file
 
@@ -498,30 +558,33 @@ def _run_redact_batch(
     print("=" * 72)
 
     counts: defaultdict[str, int] = defaultdict(int)
-    for i, filepath in enumerate(files, 1):
-        out_path = _redact_out_path(filepath, directory, output_dir)
+    needs_review = 0
+    with open(manifest, "w") as mf:
+        for i, filepath in enumerate(files, 1):
+            out_path = _redact_out_path(filepath, directory, output_dir)
 
-        if os.path.exists(out_path) and not force:
-            counts["error"] += 1
-            print(f"[{i}/{total}] {Path(out_path).name} -- ERROR: output exists (use --force)")
-            continue
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            if os.path.exists(out_path) and not force:
+                result = _redaction_error_result(
+                    filepath, out_path, "output exists (use --force)"
+                )
+            else:
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                try:
+                    result = redact_file(
+                        filepath, out_path, banner_height=banner_height,
+                        compress=compress, to_rgb=to_rgb, on_unredactable=on_unredactable,
+                    )
+                except Exception as e:  # unexpected — record and continue
+                    result = _redaction_error_result(filepath, out_path, str(e))
 
-        try:
-            result = redact_file(
-                filepath, out_path, banner_height=banner_height,
-                compress=compress, to_rgb=to_rgb,
-            )
-        except Exception as e:  # unexpected — record and continue
-            counts["error"] += 1
-            print(f"[{i}/{total}] {Path(out_path).name} -- ERROR: {e}")
-            continue
+            mf.write(result.model_dump_json() + "\n")
+            counts[result.status] += 1
+            if _redaction_needs_review(result):
+                needs_review += 1
+            _print_redaction(result, i, total)
 
-        counts[result.status] += 1
-        _print_redaction(result, i, total)
-
-        if i % GC_INTERVAL == 0:
-            gc.collect()
+            if i % GC_INTERVAL == 0:
+                gc.collect()
 
     print("\n" + "=" * 72)
     print("REDACTION SUMMARY")
@@ -531,11 +594,15 @@ def _run_redact_batch(
     print(f"Files:     {total}")
     print(f"Redacted:  {counts.get('redacted', 0)}")
     print(f"Copied:    {counts.get('copied', 0)}")
-    print(f"Skipped:   {counts.get('skipped', 0)}")
+    print(f"Omitted:   {counts.get('omitted', 0)}")
     print(f"Errored:   {counts.get('error', 0)}")
+    print(f"Manifest:  {manifest}")
+    if needs_review:
+        print(f"\n{needs_review} file(s) not fully redacted — review the manifest:")
+        print(f"  jq 'select(.status != \"redacted\")' {manifest}")
     print("=" * 72 + "\n")
 
-    return 2 if counts.get("error", 0) else 0
+    return 2 if needs_review else 0
 
 
 def _print_file_findings(report: "ScanReport", index: int, total: int, short_path: str) -> None:

@@ -96,18 +96,29 @@ Beyond *detecting* PHI, the tool can *remediate* the burned-in header **banner**
 top of ultrasound frames (e.g. Canon US), blacking it out across **all frames** and
 writing **redacted copies** to a separate directory. **Originals are never modified.**
 
+Two flags are **required** in this mode besides `--output-dir`: `--on-unredactable`
+(what to do with a file that can't be redacted) and `--manifest` (a JSONL record of
+every file's outcome, so nothing is ever *silently* dropped from the output).
+
 ```bash
 # Redact a single file (banner height derived from (0018,6011) if present)
-dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted
+dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted \
+    --on-unredactable omit --manifest run.jsonl
 
 # Batch a directory (structure is mirrored under --output-dir)
-dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \
+    --on-unredactable omit --manifest run.jsonl
 
 # Set the banner height explicitly (rows from the top)
-dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --banner-height 80
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \
+    --banner-height 80 --on-unredactable omit --manifest run.jsonl
 
 # Keep output small and lossless (needs an encoder plugin: pip install '.[codecs]')
-dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress jpeg-ls
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \
+    --compress jpeg-ls --on-unredactable omit --manifest run.jsonl
+
+# After a run, list every file that was NOT redacted and why
+jq 'select(.status != "redacted")' run.jsonl
 ```
 
 **How it decides what to do (auto method, per file):**
@@ -116,12 +127,30 @@ dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress
 - *Compressed* files (e.g. a JPEG cine loop): frames are decoded, the banner is blacked
   out, and the result is re-encoded per `--compress`. JPEG decode is deterministic, so
   untouched pixels are pixel-identical to the original.
-- Files with **no pixel data** are copied through unchanged so the output series stays complete.
+- Files that **can't be redacted** — no pixel data, PALETTE COLOR, no determinable banner
+  height, or a decode/encode failure — are handled per `--on-unredactable` (below).
+
+**Every file lands in the manifest** with one of these statuses:
+
+| status | meaning | written to `--output-dir`? |
+|--------|---------|----------------------------|
+| `redacted` | banner blacked out | yes (redacted copy) |
+| `copied`   | couldn't redact; `--on-unredactable copy` copied the original through | yes (original bytes) |
+| `omitted`  | couldn't redact; `--on-unredactable omit` wrote nothing | **no** |
+| `error`    | unexpected failure, or a CLI pre-flight problem (output exists, file missing) | no |
 
 **Key options:**
+- `--on-unredactable {copy,omit}` — **required.** For any file that can't be redacted:
+  `copy` writes the original through unchanged (keeps the series complete, but **may ship
+  un-redacted pixels**); `omit` writes nothing for it (series is intentionally incomplete;
+  the manifest records what's missing). Choose deliberately — this is a de-identification
+  decision.
+- `--manifest PATH` — **required.** JSONL, one line per input file, each a full
+  `RedactionResult` (status, reason `message`, paths, photometric, frames). Query it with
+  `jq` to audit exactly what happened.
 - `--banner-height N` — rows to black out. Optional when `(0018,6011)` *Sequence of
   Ultrasound Regions* is present (height = the topmost region's `RegionLocationMinY0`);
-  required otherwise.
+  required otherwise (files without it become `copied`/`omitted` per `--on-unredactable`).
 - `--compress {none,rle,jpeg-ls,jpeg2000,jpeg}` — output encoding for decoded frames.
   `none` (default) and `rle` are lossless with **no extra dependencies**; `jpeg-ls` /
   `jpeg2000` are lossless but need an encoder plugin (`pip install '.[codecs]'`); `jpeg`
@@ -130,7 +159,10 @@ dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress
 - `--to-rgb` — convert YBR color frames to RGB on output (default: keep native color).
 - `--force` — overwrite existing files in `--output-dir` (default: refuse).
 
-Exit codes in redaction mode: `0` all files redacted/copied, `2` one or more errored.
+Exit codes in redaction mode: `0` when every file was redacted (or benignly copied/omitted
+with no pixel data); `2` when one or more files were **not fully redacted** — i.e. any
+`error`, any `omitted`, or any `copied` file that actually had pixels. The manifest is the
+authoritative record.
 
 > **Verify on real data (color space):** the one thing that can't be checked without your
 > production files is whether the installed JPEG decoder hands pydicom the cine loop in

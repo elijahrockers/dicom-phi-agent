@@ -68,7 +68,7 @@ class RedactionResult(BaseModel):
 
     input_path: str
     output_path: str
-    status: str  # "redacted" | "copied" | "skipped" | "error"
+    status: str  # "redacted" | "copied" | "omitted" | "error"
     frames: int
     banner_height: int
     photometric_in: str | None

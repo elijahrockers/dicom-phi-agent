@@ -43,14 +43,9 @@ _COMPRESS_UID = {
 class RedactionError(Exception):
     """Raised when a file cannot be redacted.
 
-    ``status`` is the RedactionResult status this maps to: "error" for genuine
-    failures (decode/encode/params) that should surface in the exit code, or
-    "skipped" for files we intentionally decline to redact (e.g. PALETTE COLOR).
+    ``redact_file`` catches this and routes the file through ``on_unredactable``
+    (copy the original through, or omit it), recording the message as the reason.
     """
-
-    def __init__(self, message: str, status: str = "error") -> None:
-        super().__init__(message)
-        self.status = status
 
 
 def _convert_ybr_to_rgb(arr: np.ndarray) -> np.ndarray:
@@ -141,7 +136,7 @@ def redact_dataset(ds: Dataset, banner_height: int, *, to_rgb: bool = False) -> 
     photometric = str(getattr(ds, "PhotometricInterpretation", "") or "")
     if photometric.upper() == "PALETTE COLOR":
         raise RedactionError(
-            "PALETTE COLOR is not supported (black is LUT-dependent)", status="skipped"
+            "PALETTE COLOR is not supported (black is LUT-dependent)"
         )
     if banner_height <= 0:
         raise RedactionError(f"banner_height must be positive, got {banner_height}")
@@ -218,6 +213,9 @@ def _save(ds: Dataset, output_path: str) -> None:
     ds.save_as(output_path, write_like_original=False)
 
 
+ON_UNREDACTABLE_CHOICES = ("copy", "omit")
+
+
 def redact_file(
     input_path: str,
     output_path: str,
@@ -225,17 +223,26 @@ def redact_file(
     banner_height: int | None = None,
     compress: str = "none",
     to_rgb: bool = False,
-    copy_when_no_pixels: bool = True,
+    on_unredactable: str = "omit",
 ) -> RedactionResult:
     """Read the original (read-only) and write a redacted copy to ``output_path``.
 
-    The input file is never opened for writing. Files without pixel data are copied
-    through unchanged (when ``copy_when_no_pixels``) so an output series stays complete.
-    Never raises for per-file problems — failures are returned as a RedactionResult
-    with status "error" or "skipped".
+    The input file is never opened for writing. Any file that cannot be redacted for
+    any reason — no PixelData, PALETTE COLOR, an undeterminable banner height, or a
+    decode/encode failure — is handled per ``on_unredactable``:
+
+    * ``"copy"`` -> the original bytes are copied through to ``output_path`` (the output
+      series stays complete, but may ship un-redacted pixels); status ``"copied"``.
+    * ``"omit"`` -> nothing is written for that file; status ``"omitted"``.
+
+    Either way the reason is recorded in ``message``. Never raises for per-file problems
+    (only for programmer errors like an invalid option) — outcomes are returned as a
+    RedactionResult.
     """
     if compress not in COMPRESS_CHOICES:
         raise RedactionError(f"unknown compress option {compress!r}")
+    if on_unredactable not in ON_UNREDACTABLE_CHOICES:
+        raise RedactionError(f"unknown on_unredactable option {on_unredactable!r}")
 
     ds = pydicom.dcmread(input_path)  # fresh in-memory object; disk is untouched
     photometric_in = getattr(ds, "PhotometricInterpretation", None)
@@ -251,14 +258,18 @@ def redact_file(
         base.update(kw)
         return RedactionResult(**base)
 
-    if "PixelData" not in ds:
-        if copy_when_no_pixels:
+    def _unredactable(reason: str, **kw) -> RedactionResult:
+        """Copy the original through or omit it entirely, per ``on_unredactable``."""
+        if on_unredactable == "copy":
             shutil.copy2(input_path, output_path)
             return _result(
-                "copied", frames=0, photometric_out=photometric_in,
-                transfer_syntax_out=ts_in, message="no PixelData — copied unchanged",
+                "copied", photometric_out=photometric_in, transfer_syntax_out=ts_in,
+                message=f"not redacted ({reason}) — copied unchanged", **kw,
             )
-        return _result("skipped", frames=0, message="no PixelData — skipped")
+        return _result("omitted", message=f"not redacted ({reason}) — omitted", **kw)
+
+    if "PixelData" not in ds:
+        return _unredactable("no PixelData", frames=0)
 
     was_compressed = bool(ds.file_meta.TransferSyntaxUID.is_compressed)
 
@@ -269,7 +280,7 @@ def redact_file(
         ts_out = _apply_transfer_syntax(ds, compress, was_compressed)
         _save(ds, output_path)
     except RedactionError as e:
-        return _result(e.status, message=str(e))
+        return _unredactable(str(e))
 
     return _result(
         "redacted", banner_height=applied_bh, photometric_out=photometric_out,
