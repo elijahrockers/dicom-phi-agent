@@ -33,6 +33,10 @@ codecs = [
     "pylibjpeg-openjpeg",  # JPEG 2000 (--compress jpeg2000)
     "pyjpegls",            # JPEG-LS (--compress jpeg-ls)
 ]
+# Optional. Needed only for --view (preview a file in a GUI window or export a PDF).
+viz = [
+    "matplotlib>=3.7",
+]
 
 [project.scripts]
 dicom-phi-scan = "dicom_phi_scan.cli:main"

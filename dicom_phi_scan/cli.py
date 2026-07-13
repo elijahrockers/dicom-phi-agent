@@ -39,6 +39,11 @@ def main():
             "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted \\\n"
             "      --compress jpeg-ls --on-unredactable omit --manifest run.jsonl\n"
             "\n"
+            "preview a single file (GUI window over X-forwarding, or PDF export):\n"
+            "  dicom-phi-scan --view image.dcm\n"
+            "  dicom-phi-scan --view cine.dcm --pdf sheet.pdf\n"
+            "  dicom-phi-scan --view cine.dcm --frame 120 --pdf frame120.pdf\n"
+            "\n"
             "query the JSONL report:\n"
             "  jq 'select(.risk_level == \"high\") | .filepath' results.jsonl\n"
             "\n"
@@ -49,6 +54,9 @@ def main():
             "exit codes (redact mode):\n"
             "  0  every file redacted (or benignly copied/omitted with no pixel data)\n"
             "  2  one or more files not fully redacted — review the manifest\n"
+            "exit codes (view mode):\n"
+            "  0  window shown or PDF written\n"
+            "  2  error (missing file, no pixel data, decode failure, no display)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -118,6 +126,26 @@ def main():
         help="Overwrite existing files in --output-dir (default: refuse)",
     )
 
+    view = parser.add_argument_group("preview / view a single file")
+    view.add_argument(
+        "--view", action="store_true",
+        help="View mode: display a single .dcm file's pixels (2D or cineloop) in a "
+             "GUI window (needs X-forwarding), or export to PDF with --pdf",
+    )
+    view.add_argument(
+        "--frame", type=int, default=None,
+        help="Frame to show first (cineloop); with --pdf, export just this frame full-page",
+    )
+    view.add_argument(
+        "--pdf", dest="pdf", default=None,
+        help="Render to this PDF instead of opening a window (works headless). "
+             "A cineloop becomes a contact sheet unless --frame is given.",
+    )
+    view.add_argument(
+        "--sheet-cols", dest="sheet_cols", type=int, default=5,
+        help="Columns in the cineloop contact-sheet PDF (default: 5)",
+    )
+
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
@@ -140,6 +168,22 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
+    # --- View mode: preview a single file's pixels, no OCR/scan report ---
+    if args.view:
+        if args.directory:
+            print("Error: --view takes a single file, not --dir", file=sys.stderr)
+            sys.exit(1)
+        if not args.filepath:
+            print("Error: --view requires a file path", file=sys.stderr)
+            sys.exit(1)
+        if args.output_file:
+            print("Error: -o/--output is not used with --view (use --pdf to export)",
+                  file=sys.stderr)
+            sys.exit(1)
+        sys.exit(_run_view(
+            args.filepath, frame=args.frame, pdf=args.pdf, sheet_cols=args.sheet_cols,
+        ))
 
     # --- Redaction mode: write redacted copies, no OCR/scan report ---
     if args.redact_banner:
@@ -603,6 +647,67 @@ def _run_redact_batch(
     print("=" * 72 + "\n")
 
     return 2 if needs_review else 0
+
+
+def _run_view(
+    filepath: str, *, frame: int | None, pdf: str | None, sheet_cols: int
+) -> int:
+    """Preview a single file: GUI window, or PDF export with --pdf. Returns exit code."""
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        print("Error: view mode needs matplotlib — install it with: pip install '.[viz]'",
+              file=sys.stderr)
+        return 2
+
+    import pydicom
+
+    from .viewer import ViewerError, export_pdf, format_header, load_frames, show_interactive
+
+    if not os.path.isfile(filepath):
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 2
+
+    ds = pydicom.dcmread(filepath)
+    if "PixelData" not in ds:
+        print(f"Error: {Path(filepath).name} has no pixel data to view", file=sys.stderr)
+        return 2
+
+    print(f"\n{filepath}")
+    print(format_header(ds))
+    print()
+
+    photometric = str(getattr(ds, "PhotometricInterpretation", ""))
+    try:
+        frames = load_frames(ds)
+    except ViewerError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    title = Path(filepath).name
+
+    if pdf:
+        try:
+            pages = export_pdf(
+                frames, photometric, pdf, frame=frame, sheet_cols=sheet_cols, title=title,
+            )
+        except ViewerError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        print(f"Wrote {pdf} ({pages} page{'s' if pages != 1 else ''})")
+        return 0
+
+    if not os.environ.get("DISPLAY"):
+        print("Error: no X display detected — enable X-forwarding (ssh -X) or export "
+              "with --pdf PATH", file=sys.stderr)
+        return 2
+
+    try:
+        show_interactive(frames, photometric, start_frame=frame or 0, title=title)
+    except ViewerError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _print_file_findings(report: "ScanReport", index: int, total: int, short_path: str) -> None:

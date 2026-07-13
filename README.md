@@ -170,6 +170,44 @@ authoritative record.
 > the banner is truly **black** and colors elsewhere look correct. If colors look wrong,
 > re-run with `--to-rgb`.
 
+## Preview a File
+
+To *look* at a file's pixels — confirm a banner's position, verify a redaction, or read
+burned-in text — use view mode. It opens a **GUI window** (needs X-forwarding), displaying
+at native resolution with scroll-to-zoom and drag-to-pan so fine text stays readable. It
+handles both 2D single-frame files and 3D cineloops. Needs matplotlib: `pip install '.[viz]'`
+(a compressed cine also needs `pip install '.[codecs]'` to decode).
+
+```bash
+# Open a GUI window (2D: a zoomable image; cineloop: a frame slider)
+dicom-phi-scan --view image.dcm
+
+# Start a cineloop on a specific frame
+dicom-phi-scan --view cine.dcm --frame 120
+
+# No display / want an artifact: export a PDF instead (works headless)
+dicom-phi-scan --view image.dcm --pdf preview.pdf          # 2D -> one page
+dicom-phi-scan --view cine.dcm  --pdf sheet.pdf             # cineloop -> contact sheet
+dicom-phi-scan --view cine.dcm  --frame 120 --pdf f120.pdf  # one frame, full page
+```
+
+**In the cineloop window:** drag the slider or press ←/→ to step frames, space to play/pause.
+Use the matplotlib toolbar to zoom/pan into a region (e.g. the banner) at full resolution.
+
+**Color is shown faithfully** (native-space decode, same as the redactor): RGB as-is,
+YBR_FULL / YBR_FULL_422 converted to RGB, MONOCHROME2 grayscale, MONOCHROME1 inverted.
+This is also the quickest way to eyeball the cine's real color space on production data.
+
+**Key options:**
+- `--frame N` — starting frame for a cineloop; with `--pdf`, export just that frame full-page.
+- `--pdf PATH` — render to PDF instead of a window (no display needed). A cineloop becomes a
+  contact sheet unless `--frame` is given.
+- `--sheet-cols N` — columns in the contact-sheet PDF (default 5).
+
+If `$DISPLAY` is unset and you didn't pass `--pdf`, view mode errors and tells you to enable
+X-forwarding (`ssh -X`) or export a PDF. Exit codes: `0` window shown / PDF written, `2` on
+error (missing file, no pixel data, decode failure, no display).
+
 ## Python API
 
 ```python
@@ -190,7 +228,8 @@ dicom_phi_scan/
 ├── pixel_scanner.py   # Layer 2: OCR pixel text detection
 ├── redactor.py        # Banner redaction: black out the top banner, write redacted copies
 ├── scanner.py         # Orchestration pipeline
-└── tag_scanner.py     # Layer 1: DICOM header tag analysis
+├── tag_scanner.py     # Layer 1: DICOM header tag analysis
+└── viewer.py          # Preview mode: display a file (2D/cineloop) in a GUI or export a PDF
 ```
 
 ## Design Decisions
