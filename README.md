@@ -90,6 +90,54 @@ dicom-phi-scan path/to/file.dcm -o report.json --cpu
 jq 'select(.risk_level == "high") | .filepath' results.jsonl
 ```
 
+## Banner Redaction
+
+Beyond *detecting* PHI, the tool can *remediate* the burned-in header **banner** at the
+top of ultrasound frames (e.g. Canon US), blacking it out across **all frames** and
+writing **redacted copies** to a separate directory. **Originals are never modified.**
+
+```bash
+# Redact a single file (banner height derived from (0018,6011) if present)
+dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted
+
+# Batch a directory (structure is mirrored under --output-dir)
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted
+
+# Set the banner height explicitly (rows from the top)
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --banner-height 80
+
+# Keep output small and lossless (needs an encoder plugin: pip install '.[codecs]')
+dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress jpeg-ls
+```
+
+**How it decides what to do (auto method, per file):**
+- *Uncompressed* files: the banner rows are overwritten directly in the pixel array;
+  every other pixel is byte-identical to the original.
+- *Compressed* files (e.g. a JPEG cine loop): frames are decoded, the banner is blacked
+  out, and the result is re-encoded per `--compress`. JPEG decode is deterministic, so
+  untouched pixels are pixel-identical to the original.
+- Files with **no pixel data** are copied through unchanged so the output series stays complete.
+
+**Key options:**
+- `--banner-height N` — rows to black out. Optional when `(0018,6011)` *Sequence of
+  Ultrasound Regions* is present (height = the topmost region's `RegionLocationMinY0`);
+  required otherwise.
+- `--compress {none,rle,jpeg-ls,jpeg2000,jpeg}` — output encoding for decoded frames.
+  `none` (default) and `rle` are lossless with **no extra dependencies**; `jpeg-ls` /
+  `jpeg2000` are lossless but need an encoder plugin (`pip install '.[codecs]'`); `jpeg`
+  is lossy. A large uncompressed cine loop can be ~900 MB — use `--compress jpeg-ls` to
+  keep it small **and** lossless.
+- `--to-rgb` — convert YBR color frames to RGB on output (default: keep native color).
+- `--force` — overwrite existing files in `--output-dir` (default: refuse).
+
+Exit codes in redaction mode: `0` all files redacted/copied, `2` one or more errored.
+
+> **Verify on real data (color space):** the one thing that can't be checked without your
+> production files is whether the installed JPEG decoder hands pydicom the cine loop in
+> **YBR** or already-**RGB**. After a first run, decode one redacted cine frame and confirm
+> the banner is truly **black** and colors elsewhere look correct. If colors look wrong,
+> re-run with `--to-rgb`.
+
 ## Python API
 
 ```python
@@ -105,9 +153,10 @@ print(report.recommendations)  # list of action items
 
 ```
 dicom_phi_scan/
-├── cli.py             # CLI entry point (dicom-phi-scan)
-├── models.py          # Pydantic models (ScanReport, PHITagFinding, PixelPHIFinding, BatchReport)
+├── cli.py             # CLI entry point (dicom-phi-scan): scan + redaction modes
+├── models.py          # Pydantic models (ScanReport, PHITagFinding, PixelPHIFinding, RedactionResult)
 ├── pixel_scanner.py   # Layer 2: OCR pixel text detection
+├── redactor.py        # Banner redaction: black out the top banner, write redacted copies
 ├── scanner.py         # Orchestration pipeline
 └── tag_scanner.py     # Layer 1: DICOM header tag analysis
 ```

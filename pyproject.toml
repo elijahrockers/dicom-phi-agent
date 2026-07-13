@@ -23,6 +23,16 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.3.0",
 ]
+# Optional codecs. Needed to DECODE compressed pixel data (e.g. a JPEG cine loop)
+# and to use the lossless/lossy --compress options during banner redaction. RLE
+# Lossless (--compress rle) and uncompressed output (--compress none) need none of
+# these — they ship with pydicom.
+codecs = [
+    "pylibjpeg>=2.0",
+    "pylibjpeg-libjpeg",   # JPEG baseline/extended/lossless (decode + --compress jpeg)
+    "pylibjpeg-openjpeg",  # JPEG 2000 (--compress jpeg2000)
+    "pyjpegls",            # JPEG-LS (--compress jpeg-ls)
+]
 
 [project.scripts]
 dicom-phi-scan = "dicom_phi_scan.cli:main"

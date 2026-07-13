@@ -63,3 +63,17 @@ class FileError(BaseModel):
     error: str
 
 
+class RedactionResult(BaseModel):
+    """Outcome of redacting (or copying) a single DICOM file."""
+
+    input_path: str
+    output_path: str
+    status: str  # "redacted" | "copied" | "skipped" | "error"
+    frames: int
+    banner_height: int
+    photometric_in: str | None
+    photometric_out: str | None
+    transfer_syntax_out: str | None
+    message: str | None = None
+
+

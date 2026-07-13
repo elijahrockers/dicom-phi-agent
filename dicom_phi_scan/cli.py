@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .models import ScanReport
+    from .models import RedactionResult, ScanReport
+
+# Mirrors redactor.COMPRESS_CHOICES; kept literal so argparse doesn't force the
+# heavy pydicom/numpy import in redactor until after argument validation.
+REDACT_COMPRESS_CHOICES = ("none", "rle", "jpeg-ls", "jpeg2000", "jpeg")
 
 
 def main():
@@ -24,6 +28,11 @@ def main():
             "  dicom-phi-scan image.dcm -o report.json\n"
             "  dicom-phi-scan --dir ./dataset -L -o results.jsonl\n"
             "  dicom-phi-scan --dir ./dataset -L -o results.jsonl --limit 50\n"
+            "\n"
+            "redact the top banner (writes redacted copies; originals untouched):\n"
+            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted\n"
+            "  dicom-phi-scan --redact-banner image.dcm --output-dir ./redacted --banner-height 80\n"
+            "  dicom-phi-scan --redact-banner --dir ./series --output-dir ./redacted --compress jpeg-ls\n"
             "\n"
             "query the JSONL report:\n"
             "  jq 'select(.risk_level == \"high\") | .filepath' results.jsonl\n"
@@ -44,8 +53,9 @@ def main():
         help="Max number of files to scan in batch mode (default: all)",
     )
     parser.add_argument(
-        "-o", "--output", dest="output_file", required=True,
-        help="Write JSON report to file (single file: pretty JSON, batch: JSONL)",
+        "-o", "--output", dest="output_file", default=None,
+        help="Write JSON report to file (single file: pretty JSON, batch: JSONL). "
+             "Required in scan mode; not used with --redact-banner.",
     )
     parser.add_argument("-L", "--follow-symlinks", dest="follow_symlinks",
                         action="store_true",
@@ -56,6 +66,36 @@ def main():
                         help="Resume interrupted batch scan; skip files already in output JSONL")
     parser.add_argument("-v", "--verbose",
                         action="store_true", help="Verbose logging")
+
+    redact = parser.add_argument_group("banner redaction (write redacted copies)")
+    redact.add_argument(
+        "--redact-banner", action="store_true",
+        help="Redaction mode: black out the top banner and write redacted copies "
+             "to --output-dir (originals are never modified)",
+    )
+    redact.add_argument(
+        "--output-dir", dest="output_dir", default=None,
+        help="Directory for redacted copies (required with --redact-banner)",
+    )
+    redact.add_argument(
+        "--banner-height", dest="banner_height", type=int, default=None,
+        help="Rows to black out from the top. Optional if (0018,6011) Sequence of "
+             "Ultrasound Regions is present (banner height is derived from it).",
+    )
+    redact.add_argument(
+        "--compress", choices=REDACT_COMPRESS_CHOICES, default="none",
+        help="Output encoding for decoded frames (default: none/uncompressed). "
+             "rle/jpeg-ls/jpeg2000 are lossless; jpeg is lossy. jpeg-ls/jpeg2000/jpeg "
+             "need an encoder plugin. Recommended for size: jpeg-ls.",
+    )
+    redact.add_argument(
+        "--to-rgb", dest="to_rgb", action="store_true",
+        help="Convert YBR color frames to RGB on output (default: keep native color)",
+    )
+    redact.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing files in --output-dir (default: refuse)",
+    )
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -79,6 +119,37 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
+    # --- Redaction mode: write redacted copies, no OCR/scan report ---
+    if args.redact_banner:
+        if not args.output_dir:
+            print("Error: --redact-banner requires --output-dir", file=sys.stderr)
+            sys.exit(1)
+        if args.output_file:
+            print("Error: -o/--output is not used with --redact-banner (use --output-dir)",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.resume:
+            print("Error: --resume is not supported with --redact-banner", file=sys.stderr)
+            sys.exit(1)
+        if args.directory:
+            rc = _run_redact_batch(
+                args.directory, args.output_dir, args.follow_symlinks,
+                banner_height=args.banner_height, compress=args.compress,
+                to_rgb=args.to_rgb, force=args.force, limit=args.limit,
+            )
+        else:
+            rc = _run_redact_single(
+                args.filepath, args.output_dir,
+                banner_height=args.banner_height, compress=args.compress,
+                to_rgb=args.to_rgb, force=args.force,
+            )
+        sys.exit(rc)
+
+    # --- Scan mode ---
+    if not args.output_file:
+        print("Error: -o/--output is required in scan mode", file=sys.stderr)
+        sys.exit(1)
 
     from .pixel_scanner import init_reader
     from .scanner import scan_file
@@ -332,6 +403,139 @@ def _run_batch(
     if files_with_phi:
         return 1
     return 0
+
+
+def _redact_out_path(input_path: str, base_dir: str | None, output_dir: str) -> str:
+    """Map an input file to its path under output_dir, preserving structure.
+
+    For batch (base_dir given) the input's path relative to base_dir is preserved;
+    for a single file, just the basename is used.
+    """
+    if base_dir is not None:
+        rel = os.path.relpath(input_path, base_dir)
+    else:
+        rel = os.path.basename(input_path)
+    return os.path.join(output_dir, rel)
+
+
+def _print_redaction(result: "RedactionResult", index: int | None, total: int | None) -> None:
+    """Print a per-file redaction status line."""
+    prefix = f"[{index}/{total}] " if index is not None else ""
+    detail = ""
+    if result.status == "redacted":
+        detail = (f" -- REDACTED {result.frames}f, top {result.banner_height}px"
+                  f", {result.photometric_in}->{result.photometric_out}")
+    elif result.status == "copied":
+        detail = " -- COPIED (no pixel data)"
+    elif result.status == "skipped":
+        detail = f" -- SKIPPED ({result.message})"
+    else:  # error
+        detail = f" -- ERROR: {result.message}"
+    print(f"{prefix}{Path(result.output_path).name}{detail}")
+
+
+def _run_redact_single(
+    filepath: str,
+    output_dir: str,
+    *,
+    banner_height: int | None,
+    compress: str,
+    to_rgb: bool,
+    force: bool,
+) -> int:
+    """Redact a single file to output_dir. Returns exit code (0 ok, 2 error)."""
+    from .redactor import RedactionError, redact_file
+
+    if not os.path.isfile(filepath):
+        print(f"Error: File not found: {filepath}", file=sys.stderr)
+        return 2
+
+    out_path = _redact_out_path(filepath, None, output_dir)
+    if os.path.exists(out_path) and not force:
+        print(f"Error: Output exists (use --force): {out_path}", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    try:
+        result = redact_file(
+            filepath, out_path, banner_height=banner_height,
+            compress=compress, to_rgb=to_rgb,
+        )
+    except RedactionError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    _print_redaction(result, None, None)
+    if result.status == "redacted":
+        print(f"Redacted copy written to {out_path}")
+    return 2 if result.status == "error" else 0
+
+
+def _run_redact_batch(
+    directory: str,
+    output_dir: str,
+    follow_symlinks: bool,
+    *,
+    banner_height: int | None,
+    compress: str,
+    to_rgb: bool,
+    force: bool,
+    limit: int | None,
+) -> int:
+    """Redact every .dcm under directory into output_dir, preserving structure.
+
+    Returns exit code: 0 = all redacted/copied, 2 = one or more errored.
+    """
+    from .redactor import redact_file
+
+    files = _discover_dcm_files(directory, limit, follow_symlinks)
+    total = len(files)
+
+    print(f"\nRedacting {total} files from {directory} -> {output_dir}")
+    print("=" * 72)
+
+    counts: defaultdict[str, int] = defaultdict(int)
+    for i, filepath in enumerate(files, 1):
+        out_path = _redact_out_path(filepath, directory, output_dir)
+
+        if os.path.exists(out_path) and not force:
+            counts["error"] += 1
+            print(f"[{i}/{total}] {Path(out_path).name} -- ERROR: output exists (use --force)")
+            continue
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+        try:
+            result = redact_file(
+                filepath, out_path, banner_height=banner_height,
+                compress=compress, to_rgb=to_rgb,
+            )
+        except Exception as e:  # unexpected — record and continue
+            counts["error"] += 1
+            print(f"[{i}/{total}] {Path(out_path).name} -- ERROR: {e}")
+            continue
+
+        counts[result.status] += 1
+        _print_redaction(result, i, total)
+
+        if i % GC_INTERVAL == 0:
+            gc.collect()
+
+    print("\n" + "=" * 72)
+    print("REDACTION SUMMARY")
+    print("=" * 72)
+    print(f"\nInput:     {directory}")
+    print(f"Output:    {output_dir}")
+    print(f"Files:     {total}")
+    print(f"Redacted:  {counts.get('redacted', 0)}")
+    print(f"Copied:    {counts.get('copied', 0)}")
+    print(f"Skipped:   {counts.get('skipped', 0)}")
+    print(f"Errored:   {counts.get('error', 0)}")
+    print("=" * 72 + "\n")
+
+    return 2 if counts.get("error", 0) else 0
 
 
 def _print_file_findings(report: "ScanReport", index: int, total: int, short_path: str) -> None:
